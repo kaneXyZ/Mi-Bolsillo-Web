@@ -5,20 +5,18 @@ import { BalanceCard } from "@/components/mibolsillo/balance-card";
 import { DebtCard } from "@/components/mibolsillo/debt-card";
 import { IncomeExpenseModals } from "@/components/mibolsillo/income-expense-modals";
 import { ProjectionChart } from "@/components/mibolsillo/projection-chart";
+import { DashboardCarousel } from "@/components/mibolsillo/dashboard-carousel";
+import { EfectivoCard } from "@/components/mibolsillo/efectivo-card";
+import { ResumenGlobalCard } from "@/components/mibolsillo/resumen-global-card";
 import { createIngreso, createGasto } from "./actions";
 import { calcularProyeccion } from "@/lib/mibolsillo/projection";
+import {
+  ensureCategoriaEfectivo,
+  ensureCuentaEfectivo,
+} from "@/app/protected/accounts/actions";
+import { formatCLP } from "@/lib/mibolsillo/format"; // o define el helper inline si prefieres
 
-
-// app/protected/page.tsx
 export const metadata = { title: "Dashboard — Mi Bolsillo" };
-
-function formatCurrency(value: number) {
-  return new Intl.NumberFormat("es-CL", {
-    style: "currency",
-    currency: "CLP",
-    maximumFractionDigits: 0,
-  }).format(value);
-}
 
 export default async function ProtectedPage() {
   const supabase = await createClient();
@@ -38,6 +36,11 @@ export default async function ProtectedPage() {
 
   if (!profile?.preguntas_completadas) redirect("/onboarding");
 
+  await Promise.all([
+    ensureCategoriaEfectivo(user.id),
+    ensureCuentaEfectivo(user.id),
+  ]);
+
   const [{ data: accounts }, { data: transactions }, { data: categories }] =
     await Promise.all([
       supabase.from("accounts").select("*").eq("user_id", user.id),
@@ -48,7 +51,7 @@ export default async function ProtectedPage() {
         .order("fecha", { ascending: false }),
       supabase
         .from("categories")
-        .select("id, nombre, tipo, is_fixed")
+        .select("id, nombre, tipo, is_fixed, is_system")
         .eq("user_id", user.id),
     ]);
 
@@ -56,20 +59,36 @@ export default async function ProtectedPage() {
   const trans = transactions ?? [];
   const cats = categories ?? [];
 
-  // --- Totales generales ---
+  /* ── Separar cuenta efectivo ── */
+  const cuentaEfectivo = cuentas.find(
+    (c: any) =>
+      c.tipo === "efectivo" ||
+      c.bank_code === "efectivo" ||
+      (c.nombre ?? "").toLowerCase() === "efectivo"
+  );
+  const cuentasSinEfectivo = cuentas.filter(
+    (c: any) =>
+      !(
+        c.tipo === "efectivo" ||
+        c.bank_code === "efectivo" ||
+        (c.nombre ?? "").toLowerCase() === "efectivo"
+      )
+  );
+
+  /* ── Totales ── */
   const saldoTotal = cuentas.reduce(
-    (acc, cta) => acc + Number(cta.saldo_actual ?? 0),
+    (acc, cta: any) => acc + Number(cta.saldo_actual ?? 0),
     0
   );
   const deudaCuentas = cuentas.reduce(
-    (acc, cta) => acc + Number(cta.deuda_actual ?? 0),
+    (acc, cta: any) => acc + Number(cta.deuda_actual ?? 0),
     0
   );
   const gastosTotales = trans
     .filter((t) => t.tipo === "gasto")
     .reduce((acc, t) => acc + Number(t.monto ?? 0), 0);
 
-  // --- Proyección avanzada ---
+  /* ── Proyección base ── */
   const proyeccion = calcularProyeccion(
     new Date(),
     saldoTotal,
@@ -100,26 +119,91 @@ export default async function ProtectedPage() {
   const categoriasIngreso = cats.filter((c) => c.tipo === "ingreso");
   const categoriasGasto = cats.filter((c) => c.tipo === "gasto");
 
+  /* ── Gastos fijos del mes ── */
+  const ahora = new Date();
+  const mesActual = ahora.getMonth();
+  const anoActual = ahora.getFullYear();
+
+  const catsFijasGasto = cats
+    .filter((c) => c.tipo === "gasto" && c.is_fixed)
+    .map((c) => {
+      const totalMes = trans
+        .filter((t) => {
+          if (t.tipo !== "gasto" || t.category_id !== c.id) return false;
+          const d = new Date(t.fecha);
+          return d.getMonth() === mesActual && d.getFullYear() === anoActual;
+        })
+        .reduce((acc, t) => acc + Number(t.monto ?? 0), 0);
+      return { ...c, totalMes };
+    })
+    .sort((a, b) => b.totalMes - a.totalMes);
+
+  const totalGastosFijosMes = catsFijasGasto.reduce(
+    (acc, c) => acc + c.totalMes,
+    0
+  );
+
+  const promedioIngresoMensual =
+    proyeccion.promedioIngresoFijo ??
+    Number(profile?.ingreso_mensual_declarado ?? 0);
+
+  const liquidezMensualEstimada = promedioIngresoMensual - totalGastosFijosMes;
+
   return (
     <main className="min-h-screen flex flex-col items-center bg-background text-foreground">
       <ProtectedShell userName={profile?.nombre}>
-        {/* Balance general */}
+
+        {/* ① Efectivo — siempre arriba, fuera del carrusel */}
+        {cuentaEfectivo && (
+          <div className="mb-3">
+            <EfectivoCard
+              saldo={Number(cuentaEfectivo.saldo_actual ?? 0)}
+              nombre={cuentaEfectivo.nombre ?? "Efectivo"}
+            />
+          </div>
+        )}
+
+        {/* ② Carrusel — SOLO tarjetas de banco / crédito */}
+        <DashboardCarousel
+          cuentas={cuentasSinEfectivo as any}
+          creditos={[]}
+        />
+
+        {/* ③ Resumen global — entre carrusel y Balance general */}
+        <div className="mt-3 w-full">
+          <ResumenGlobalCard
+            saldoTotal={saldoTotal}
+            deudaTotal={deudaCuentas}
+            cuentasCount={cuentas.length}
+            creditosCount={0}
+          />
+        </div>
+
+        {/* ④ Balance general TODO:// */}
         <BalanceCard saldoTotal={saldoTotal} cuentasCount={cuentas.length} />
 
-        {/* Deuda */}
+        {/* ⑤ Deuda global + gastos fijos + proyección de liquidez */}
         <DebtCard
           endeudamiento={deudaCuentas}
           gastosTotales={gastosTotales}
+          saldoActual={saldoTotal}
+          promedioIngresoMensual={promedioIngresoMensual}
+          totalGastosFijosMes={totalGastosFijosMes}
+          liquidezMensualEstimada={liquidezMensualEstimada}
+          catsFijasGasto={catsFijasGasto.map((c) => ({
+            id: c.id,
+            nombre: c.nombre,
+            totalMes: c.totalMes,
+          }))}
         />
-
-        {/* Métricas del mes: 2x2 + saldo proyectado full width */}
-        <section className="grid grid-cols-2 gap-2">
+        {/* ⑥ Métricas del mes 2×2 + saldo proyectado */}
+        <section className="grid grid-cols-2 gap-2 mt-2">
           <div className="bg-card rounded-xl p-2 border border-border">
             <span className="block text-[10px] text-muted-foreground">
               Ingresos fijos mes
             </span>
             <span className="block text-[11px] font-semibold text-emerald-400">
-              {formatCurrency(proyeccion.ingresosMesFijos)}
+              {formatCLP(proyeccion.ingresosMesFijos)}
             </span>
           </div>
           <div className="bg-card rounded-xl p-2 border border-border">
@@ -127,7 +211,7 @@ export default async function ProtectedPage() {
               Gastos fijos mes
             </span>
             <span className="block text-[11px] font-semibold text-rose-400">
-              {formatCurrency(proyeccion.gastosMesFijos)}
+              {formatCLP(proyeccion.gastosMesFijos)}
             </span>
           </div>
           <div className="bg-card rounded-xl p-2 border border-border">
@@ -135,7 +219,7 @@ export default async function ProtectedPage() {
               Ingresos variables
             </span>
             <span className="block text-[11px] font-semibold text-emerald-300">
-              {formatCurrency(proyeccion.ingresosMesVariables)}
+              {formatCLP(proyeccion.ingresosMesVariables)}
             </span>
           </div>
           <div className="bg-card rounded-xl p-2 border border-border">
@@ -143,7 +227,7 @@ export default async function ProtectedPage() {
               Gastos variables
             </span>
             <span className="block text-[11px] font-semibold text-rose-300">
-              {formatCurrency(proyeccion.gastosMesVariables)}
+              {formatCLP(proyeccion.gastosMesVariables)}
             </span>
           </div>
           <div className="col-span-2 bg-card rounded-xl p-2 border border-border">
@@ -158,36 +242,36 @@ export default async function ProtectedPage() {
                   : "text-rose-400")
               }
             >
-              {formatCurrency(proyeccion.saldoProyectado)}
+              {formatCLP(proyeccion.saldoProyectado)}
             </span>
           </div>
         </section>
 
-        {/* Gráfico evolutivo de ingresos/gastos */}
+        {/* ⑦ Gráfico evolutivo */}
         <ProjectionChart
           historial={proyeccion.historial}
           promedioIngresoFijo={proyeccion.promedioIngresoFijo}
           saldoActual={saldoTotal}
         />
 
-        {/* Botones ingreso / gasto */}
+        {/* ⑧ Botones ingreso / gasto */}
         <IncomeExpenseModals
-          cuentas={cuentas}
+          cuentas={cuentas as any}
           categoriasIngreso={categoriasIngreso}
           categoriasGasto={categoriasGasto}
           createIngreso={createIngreso}
           createGasto={createGasto}
         />
 
-        {/* Últimos movimientos como tarjetas */}
-        <section className="bg-card rounded-2xl p-3 shadow-lg border border-border">
-          <h2 className="text-sm font-semibold mb-2">
-            Últimos movimientos
-          </h2>
+        {/* ⑨ Últimos movimientos */}
+        <section className="bg-card rounded-2xl p-3 shadow-lg border border-border mt-3">
+          <h2 className="text-sm font-semibold mb-2">Últimos movimientos</h2>
           <div className="flex flex-col gap-2 max-h-64 overflow-y-auto">
             {trans.slice(0, 10).map((t) => {
               const cat = cats.find((c) => c.id === t.category_id);
               const esIngreso = t.tipo === "ingreso";
+              const esEfectivo =
+                cat?.nombre && cat.nombre.toLowerCase() === "efectivo";
               return (
                 <div
                   key={t.id}
@@ -209,8 +293,27 @@ export default async function ProtectedPage() {
                         {t.descripcion || (esIngreso ? "Ingreso" : "Gasto")}
                       </span>
                       <span className="text-[11px] text-muted-foreground flex items-center gap-1">
-                        {cat?.nombre || "Sin categoría"}
-                        {cat?.is_fixed && (
+                        {esEfectivo ? (
+                          <span className="inline-flex items-center gap-0.5 text-amber-400">
+                            💵 Efectivo
+                            <svg
+                              xmlns="http://www.w3.org/2000/svg"
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2.5"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              className="w-2.5 h-2.5"
+                            >
+                              <rect x="3" y="11" width="18" height="11" rx="2" />
+                              <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                            </svg>
+                          </span>
+                        ) : (
+                          cat?.nombre ?? "Sin categoría"
+                        )}
+                        {cat?.is_fixed && !esEfectivo && (
                           <span className="text-[9px] px-1 rounded-full bg-secondary border border-border">
                             fijo
                           </span>
@@ -226,7 +329,7 @@ export default async function ProtectedPage() {
                       }
                     >
                       {esIngreso ? "+" : "-"}
-                      {formatCurrency(Number(t.monto))}
+                      {formatCLP(Number(t.monto))}
                     </span>
                     <span className="block text-[10px] text-muted-foreground">
                       {new Date(t.fecha).toLocaleDateString("es-CL", {
@@ -245,6 +348,7 @@ export default async function ProtectedPage() {
             )}
           </div>
         </section>
+
       </ProtectedShell>
     </main>
   );
